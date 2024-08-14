@@ -811,6 +811,7 @@ def _convert_block_spec_to_block_mapping(
     grid: GridMappingGrid,
     mapped_dims: tuple[int, ...],
 ) -> BlockMapping:
+  array_aval = jax_core.physical_aval(array_aval)
   if block_spec is no_block_spec:
     block_spec = BlockSpec(None, None)
   return block_spec.to_block_mapping(
