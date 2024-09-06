@@ -132,7 +132,7 @@ def build_kernel(
   if stages < 2:
     raise ValueError(f"Need at least 2 stages, but got {stages=}")
   if not rhs_transpose and jnp.dtype(rhs_dtype).itemsize != 2:
-    raise ValueError("Transpose only supported for only happen for 16bit types")
+    raise ValueError(f"Transpose only supported for 16bit types (got: {rhs_transpose=}, {rhs_dtype=})")
   if swizzle not in {32, 64, 128}:
     raise ValueError(f"swizzle must be 32, 64, or 128, but got {swizzle=}")
 
@@ -393,61 +393,65 @@ def verify(
 
 
 if __name__ == "__main__":
-  dtype = jnp.dtype(jnp.float16)
-  m, k, n = 16384, 2048, 16384
+  for dtype in (jnp.float16, jnp.float32):
+    dtype = jnp.dtype(dtype)
+    # rhs_transpose means that we need to transpose the data feeding
+    # it to wgmma. Wgmma can handle 2byte dtypes that is row major.
+    rhs_transpose = jnp.dtype(dtype).itemsize != 2
+    m, k, n = 16384, 2048, 16384
 
-  kx, ky = random.split(random.key(1234))
-  x = random.uniform(kx, (m, k), dtype=dtype)
-  y = random.uniform(ky, (k, n), dtype=dtype)
+    kx, ky = random.split(random.key(1234))
+    x = random.uniform(kx, (m, k), dtype=dtype)
+    y = random.uniform(ky, (k, n), dtype=dtype)
 
-  tile_m = tile_n = (64, 128)
-  cluster_m = cluster_n = (1, 2)
-  swizzle = (128,)  # 64 can be a good choice for some shapes too!
-  stages = (2, 4, 5, 6)
-  grid_tile_n = (1, 4, 16)
-  configs = itertools.product(tile_m, tile_n, cluster_m, cluster_n, stages, swizzle, grid_tile_n)
-  names = ("tile_m", "tile_n", "cluster_m", "cluster_n", "stages", "swizzle", "grid_tile_n")
-  best_runtime = float("inf")
-  best_kwargs = {}
-  for config in configs:
-    kwargs = dict(zip(names, config))
-    if kwargs["cluster_m"] * kwargs["cluster_n"] > 8:
-      continue
-    if m < kwargs["tile_m"] or n < kwargs["tile_n"]:
-      continue
-    if (m // kwargs["tile_m"]) % kwargs["cluster_m"]:
-      continue
-    if (n // kwargs["tile_n"]) % kwargs["cluster_n"]:
-      continue
-    if n % kwargs["grid_tile_n"]:
-      continue
-    # This is a heuristic, not a strict correctness check. You can relax it
-    # for a more complete search space.
-    if kwargs["tile_m"] == kwargs["tile_n"] == 64:
-      continue
-    try:
-      f = build_kernel(
-          m, n, k, dtype, dtype, dtype, wgmma_impl=WGMMADefaultImpl, **kwargs
-      )
-      _, runtime = profiler.measure(f, x, y)
-    except ValueError as e:
-      if "Mosaic GPU kernel exceeds available shared memory" not in str(e):
-        raise
-      runtime = float("inf")
-    # Enable this to get more detailed information.
-    # else:
-    #   print(" ".join(f"{k}={v}" for k, v in kwargs.items()), int(runtime * 1000))
-    if runtime < best_runtime:
-      best_runtime = runtime
-      best_kwargs = kwargs
-  if not best_kwargs:
-    raise ValueError("No valid configuration found")
+    tile_m = tile_n = (64, 128)
+    cluster_m = cluster_n = (1, 2)
+    swizzle = (128,)  # 64 can be a good choice for some shapes too!
+    stages = (2, 4, 5, 6)
+    grid_tile_n = (1, 4, 16)
+    configs = itertools.product(tile_m, tile_n, cluster_m, cluster_n, stages, swizzle, grid_tile_n)
+    names = ("tile_m", "tile_n", "cluster_m", "cluster_n", "stages", "swizzle", "grid_tile_n")
+    best_runtime = float("inf")
+    best_kwargs = {}
+    for config in configs:
+      kwargs = dict(zip(names, config))
+      if kwargs["cluster_m"] * kwargs["cluster_n"] > 8:
+        continue
+      if m < kwargs["tile_m"] or n < kwargs["tile_n"]:
+        continue
+      if (m // kwargs["tile_m"]) % kwargs["cluster_m"]:
+        continue
+      if (n // kwargs["tile_n"]) % kwargs["cluster_n"]:
+        continue
+      if n % kwargs["grid_tile_n"]:
+        continue
+      # This is a heuristic, not a strict correctness check. You can relax it
+      # for a more complete search space.
+      if kwargs["tile_m"] == kwargs["tile_n"] == 64:
+        continue
+      try:
+        f = build_kernel(
+            m, n, k, dtype, dtype, dtype, wgmma_impl=WGMMADefaultImpl, rhs_transpose=rhs_transpose, **kwargs
+        )
+        _, runtime = profiler.measure(f, x, y)
+      except ValueError as e:
+        if "Mosaic GPU kernel exceeds available shared memory" not in str(e):
+          raise
+        runtime = float("inf")
+      # Enable this to get more detailed information.
+      # else:
+      #   print(" ".join(f"{k}={v}" for k, v in kwargs.items()), int(runtime * 1000))
+      if runtime < best_runtime:
+        best_runtime = runtime
+        best_kwargs = kwargs
+    if not best_kwargs:
+      raise ValueError("No valid configuration found")
 
-  runtime, ref_runtime = verify(
-      m=m, k=k, n=n, in_dtype=dtype, out_dtype=dtype, **best_kwargs
-  )
-  tflops = float(2 * k * m * n) / (runtime / 1e3) / 1e12
-  ref_tflops = float(2 * k * m * n) / (ref_runtime / 1e3) / 1e12
-  print("Best parameters: ", " ".join(f"{k}={v}" for k, v in best_kwargs.items()))
-  print(f"Kernel:    {runtime * 1000:.1f} us = {tflops:.1f} TFLOPS")
-  print(f"Reference: {ref_runtime * 1000:.1f} us = {ref_tflops:.1f} TFLOPS")
+    runtime, ref_runtime = verify(
+        m=m, k=k, n=n, in_dtype=dtype, out_dtype=dtype, rhs_transpose=rhs_transpose, **best_kwargs
+    )
+    tflops = float(2 * k * m * n) / (runtime / 1e3) / 1e12
+    ref_tflops = float(2 * k * m * n) / (ref_runtime / 1e3) / 1e12
+    print("Best parameters: ", " ".join(f"{k}={v}" for k, v in best_kwargs.items()))
+    print(f"Kernel:    {runtime * 1000:.1f} us = {tflops:.1f} TFLOPS")
+    print(f"Reference: {ref_runtime * 1000:.1f} us = {ref_tflops:.1f} TFLOPS")
