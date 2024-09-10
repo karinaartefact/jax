@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Sequence
 import enum
-from functools import partial
+from functools import cmp_to_key, partial
 import inspect
 import itertools as it
 from math import prod
@@ -55,6 +55,8 @@ from jax._src.util import (HashableFunction, HashablePartial, unzip2, unzip3,
                            as_hashable_function, memoize, partition_list,
                            merge_lists, split_list, subs_list2)
 from jax.api_util import flatten_fun_nokwargs, shaped_abstractify, argnums_partial
+from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import hlo, sdy
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
@@ -643,16 +645,109 @@ def _rule_missing(prim: core.Primitive, *_, **__):
 
 # Lowering
 
+
+def _manual_axis_compare(mesh, lhs, rhs):
+  for axis in mesh.axis_names:
+    if axis == lhs:
+      return -1
+    if axis == rhs:
+      return 1
+  raise ValueError(
+      f"axis names '{lhs}' and '{rhs}' not present in mesh '{mesh}'")
+
+
+def _shardy_shard_map_sharding(
+    ctx: mlir.LoweringRuleContext, mesh, manual_axes,
+    names, aval_in) -> ir.Attribute:
+  axes = {name: i for i, ns in names.items() for name in ns}
+  # Shardy requires all manual axes in an in/out sharding to be used. So if an
+  # axis doesn't shard an input/output, it must be marked as a replicated axes.
+  replicated_axes = list(set(manual_axes) - set(axes.keys()))
+  # The order of replicated axes must be the same as the order of axes in the
+  # mesh.
+  replicated_axes = sorted(
+      replicated_axes, key=cmp_to_key(partial(_manual_axis_compare, mesh)))
+  ns = _make_scoped_manual_sharding(ctx, mesh, axes)
+  if dtypes.issubdtype(aval_in.dtype, dtypes.extended):
+    ns = sharding_impls.physical_sharding(aval_in, ns)
+    aval_in = core.physical_aval(aval_in)
+  # We don't have replicated axes on `SdyArraySharding`, so create the sharding
+  # and add the replicated axes on the raw MLIR attr.
+  sharding = ns._to_sdy_sharding(aval_in.ndim).build()
+  return sdy.TensorShardingAttr.get(
+      sharding.mesh_name,
+      sharding.dimension_shardings,
+      [sdy.AxisRefAttr.get(axis) for axis in replicated_axes])
+
+
+def _shard_map_lowering_shardy(
+    ctx, in_nodes, jaxpr, mesh, in_names, out_names, auto):
+  in_avals_ = [v.aval for v in jaxpr.invars]
+  if isinstance(ctx.module_context.axis_context, sharding_impls.SPMDAxisContext):
+    # Nested `ManualComputationOp`s cannot refer to axes that are already
+    # manual. So figure out what axes are free thus far and get the new axis
+    # context.
+    free_axis = (
+        frozenset(mesh.axis_names) - ctx.module_context.axis_context.manual_axes)
+    new_axis_context = sharding_impls.SPMDAxisContext(mesh, free_axis - auto)
+  else:
+    new_axis_context = sharding_impls.SPMDAxisContext(
+        mesh, frozenset(mesh.axis_names) - auto)
+  effects = list(ctx.tokens_in.effects())
+  output_types = map(mlir.aval_to_ir_type, ctx.avals_out)
+  output_types = [hlo.TokenType.get()] * len(effects) + output_types
+  sub_ctx = ctx.module_context.replace(axis_context=new_axis_context)
+  tokens = [ctx.tokens_in.get(eff) for eff in effects]
+  args = (*ctx.dim_var_values, *tokens, *in_nodes)
+
+  manual_axes = sub_ctx.axis_context.manual_axes
+  mesh_shape = mesh.shape
+  manual_axes_size = np.prod([mesh_shape[a] for a in manual_axes])
+  if manual_axes_size == 1:
+    # No need for a `ManualComputationOp` if all manual axes are size 1.
+    out_nodes, tokens_out = mlir.jaxpr_subcomp(
+        sub_ctx, jaxpr, ctx.name_stack, mlir.TokenSet(),
+        (), *args, dim_var_values=ctx.dim_var_values)
+    ctx.set_tokens_out(tokens_out)
+    return out_nodes
+
+  # Shardy requires manual axes to be sorted in the same order as the mesh.
+  manual_axes = sorted(
+      manual_axes, key=cmp_to_key(partial(_manual_axis_compare, mesh)))
+  in_shardings = sdy.TensorShardingPerValueAttr.get(map(
+      partial(_shardy_shard_map_sharding, ctx, mesh, manual_axes),
+      in_names, ctx.avals_in))
+  out_shardings = sdy.TensorShardingPerValueAttr.get(map(
+      partial(_shardy_shard_map_sharding, ctx, mesh, manual_axes),
+      out_names, ctx.avals_out))
+  manual_computation_op = sdy.ManualComputationOp(
+      output_types, args, in_shardings, out_shardings,
+      sdy.ManualAxesAttr.get(ir.ArrayAttr.get(
+          [ir.StringAttr.get(i) for i in manual_axes])))
+  block = ir.Block.create_at_start(
+      manual_computation_op.body, map(mlir.aval_to_ir_type, in_avals_))
+  with ir.InsertionPoint(block), core.extend_axis_env_nd(tuple(mesh.shape.items())):
+    out_nodes_, tokens_out = mlir.jaxpr_subcomp(
+        sub_ctx, jaxpr, ctx.name_stack, mlir.TokenSet(),
+        (), *block.arguments, dim_var_values=ctx.dim_var_values)
+    ctx.set_tokens_out(tokens_out)
+    sdy.ReturnOp([ir.Value(x) for x in out_nodes_])
+
+  return manual_computation_op.results
+
+
 def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_names, out_names,
                         check_rep, rewrite, auto):
   del check_rep, rewrite
+  if config.use_shardy_partitioner.value:
+    return _shard_map_lowering_shardy(
+        ctx, in_nodes, jaxpr, mesh, in_names, out_names, auto)
   in_avals_ = [v.aval for v in jaxpr.invars]
   out_avals_ = [x.aval for x in jaxpr.outvars]
   in_nodes_ = map(partial(_xla_shard, ctx, mesh, auto), in_names, ctx.avals_in,
                   in_avals_, in_nodes)
   new_axis_context = sharding_impls.SPMDAxisContext(
-      mesh, frozenset(mesh.axis_names) - auto
-  )
+      mesh, frozenset(mesh.axis_names) - auto)
   sub_ctx = ctx.module_context.replace(axis_context=new_axis_context)
   with core.extend_axis_env_nd(tuple(mesh.shape.items())):
     out_nodes_, tokens_out = mlir.call_lowering(
