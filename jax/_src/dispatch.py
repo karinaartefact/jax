@@ -33,6 +33,7 @@ from jax._src import basearray
 from jax._src import config
 from jax._src import core
 from jax._src import api
+from jax._src import array
 from jax._src import dtypes
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -331,14 +332,14 @@ def _check_special(name: str, dtype: np.dtype, buf: basearray.Array) -> None:
 def _identity_fn(x):
   return x
 
-def _different_device_order_reshard(x, target_sharding):
-  from jax._src import api, array
-
+def _different_device_order_reshard(x, target_sharding, donate: bool):
   x._check_if_deleted()
   inp_sharding = x.sharding
 
+  donate_argnums = 0 if donate else None
   if inp_sharding._device_assignment == target_sharding._device_assignment:
-    return api.jit(_identity_fn, out_shardings=target_sharding)(x)
+    return api.jit(_identity_fn, out_shardings=target_sharding,
+                   donate_argnums=donate_argnums)(x)
 
   if inp_sharding.device_set != target_sharding.device_set:
     inp_ids = [d.id for d in inp_sharding._device_assignment]
@@ -381,7 +382,8 @@ def _different_device_order_reshard(x, target_sharding):
                     memory_kind=target_sharding.memory_kind),
       x._arrays,
   )
-  return api.jit(_identity_fn, out_shardings=target_sharding)(new_x)
+  return api.jit(_identity_fn, out_shardings=target_sharding,
+                 donate_argnums=donate_argnums)(new_x)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -403,7 +405,7 @@ class _DeferredShardArg:
     return pxla.global_aval_to_result_handler(self.aval, self.s, self.committed)
 
 
-def _device_put_sharding_impl(x, aval, device):
+def _device_put_sharding_impl(x, aval, device, donate):
   from jax._src import array
   from jax.experimental import multihost_utils
 
@@ -415,14 +417,14 @@ def _device_put_sharding_impl(x, aval, device):
     if (not s.is_fully_addressable and
         isinstance(x, array.ArrayImpl) and not x.is_fully_addressable):
       assert isinstance(s, Sharding)
-      return _different_device_order_reshard(x, s)
+      return _different_device_order_reshard(x, s, donate)
 
     if (s.is_fully_addressable and isinstance(x, array.ArrayImpl) and
         x.is_fully_addressable and s.num_devices > 1 and
         s._internal_device_list != x.sharding._internal_device_list and  # pytype: disable=attribute-error
         s.device_set == x.sharding.device_set):
       assert isinstance(s, Sharding)
-      return _different_device_order_reshard(x, s)
+      return _different_device_order_reshard(x, s, donate)
 
     if not s.is_fully_addressable:
       if ((isinstance(x, array.ArrayImpl) and not x._committed) or
@@ -433,7 +435,8 @@ def _device_put_sharding_impl(x, aval, device):
                 f"{type(x)} passed to device_put is not the same on each"
                 " process. Make sure you are passing the same value of"
                 f" {type(x)} on each process."))
-        return api.jit(_identity_fn, out_shardings=s)(x)
+        return api.jit(_identity_fn, out_shardings=s,
+                       donate_argnums=(0 if donate else None))(x)
       # TODO(yashkatariya,mattjj): Link to a doc about McJAX and jax.Array.
       raise ValueError(
           "device_put's second argument must be a Device or a Sharding which"
@@ -463,7 +466,7 @@ def _device_put_impl(
     *,
     device: Device | Sharding | Layout | None,
     src: Device | Sharding | Layout | None,
-):
+    donate: bool):
   if (isinstance(device, TransferToMemoryKind) or
       isinstance(src, TransferToMemoryKind)):
     raise ValueError(
@@ -482,7 +485,7 @@ def _device_put_impl(
     dll = l.device_local_layout
     x_dll = x.layout.device_local_layout if hasattr(x, 'layout') else None
     if dll is None and l.sharding is None:
-      return _device_put_sharding_impl(x, aval, l.sharding)
+      return _device_put_sharding_impl(x, aval, l.sharding, donate)
     if (not isinstance(l.sharding, Sharding) or
         not isinstance(dll, (DeviceLocalLayout, type(None)))):
       raise ValueError(
@@ -491,21 +494,22 @@ def _device_put_impl(
     if getattr(x, 'layout', None) == l and getattr(x, '_committed', False):
       return x
     if x_dll is None and dll is None:
-      return _device_put_sharding_impl(x, aval, l.sharding)
-    return api.jit(_identity_fn, out_shardings=l)(x)
+      return _device_put_sharding_impl(x, aval, l.sharding, donate)
+    return api.jit(_identity_fn, out_shardings=l,
+                   donate_argnums=(0 if donate else None))(x)
 
-  return _device_put_sharding_impl(x, aval, device)
+  return _device_put_sharding_impl(x, aval, device, donate)
 
 
 def _batched_device_put_impl(
     *xs,
     devices: Sequence[Device | Sharding | Layout | None],
     srcs: Sequence[Device | Sharding | Layout | None],
-):
+    donations: Sequence[bool]):
   ys = []
   shard_arg_indices, shard_arg_xs, shard_arg_shardings = [], [], []
-  for i, (x, device, src) in enumerate(zip(xs, devices, srcs)):
-    y = _device_put_impl(x, device=device, src=src)
+  for i, (x, device, src, donate) in enumerate(zip(xs, devices, srcs, donations)):
+    y = _device_put_impl(x, device=device, src=src, donate=donate)
     if isinstance(y, _DeferredShardArg):
       shard_arg_indices.append(i)
       shard_arg_xs.append(y.x)
@@ -529,17 +533,18 @@ def _batched_device_put_impl(
 device_put_p = core.Primitive('device_put')
 device_put_p.multiple_results = True
 device_put_p.def_impl(_batched_device_put_impl)
-device_put_p.def_abstract_eval(lambda *xs, devices, srcs: xs)
+device_put_p.def_abstract_eval(lambda *xs, devices, srcs, donations: xs)
 
-def _device_put_transpose(cts, *_, devices, srcs):
+def _device_put_transpose(cts, *_, devices, srcs, donations):
   results = [None] * len(cts)
   dp_args = []
-  for i, (ct, device, src) in enumerate(zip(cts, devices, srcs)):
+  for i, (ct, device, src, d) in enumerate(zip(cts, devices, srcs, donations)):
     if type(ct) is not ad.Zero:
-      dp_args.append((i, ct, device, src))
+      dp_args.append((i, ct, device, src, d))
   if dp_args:
-    indices, args, devices, srcs = list(zip(*dp_args))
-    ys = device_put_p.bind(*args, devices=srcs, srcs=devices)
+    indices, args, devices, srcs, donations = list(zip(*dp_args))
+    ys = device_put_p.bind(*args, devices=srcs, srcs=devices,
+                           donations=donations)
     for i, y in zip(indices, ys):
       results[i] = y
   return results
@@ -554,12 +559,12 @@ def _device_put_batcher(batched_args, batch_dims, **params):
   return device_put_p.bind(*batched_args, **params), batch_dims
 batching.primitive_batchers[device_put_p] = _device_put_batcher
 
-def _tpu_gpu_device_put_lowering(ctx, *xs, devices, srcs):
+def _tpu_gpu_device_put_lowering(ctx, *xs, devices, srcs, donations):
   # TODO(yashkatariya): Maybe we should add the custom calls anyways if it's
   # being used inside jit? Atleast for now, this preserves the old behavior.
   if ctx.module_context.all_default_mem_kind:
     return xs
-  def lower(x, device, src, aval, out_aval):
+  def lower(x, device, aval, out_aval):
     if (isinstance(device, (Sharding, TransferToMemoryKind)) and
         device.memory_kind is not None):
       if isinstance(device, Sharding):
@@ -568,7 +573,7 @@ def _tpu_gpu_device_put_lowering(ctx, *xs, devices, srcs):
       x = mlir.wrap_with_memory_kind(x, device.memory_kind, out_aval)
       return x
     return x
-  return list(map(lower, xs, devices, srcs, ctx.avals_in, ctx.avals_out))
+  return list(map(lower, xs, devices, ctx.avals_in, ctx.avals_out))
 
 mlir.register_lowering(
   device_put_p, _tpu_gpu_device_put_lowering, platform='tpu')
@@ -576,11 +581,11 @@ mlir.register_lowering(
   device_put_p, _tpu_gpu_device_put_lowering, platform='gpu')
 
 
-def _common_device_put_lowering(ctx, *xs, devices, srcs):
+def _common_device_put_lowering(ctx, *xs, devices, srcs, donations):
   return xs
 mlir.register_lowering(device_put_p, _common_device_put_lowering)
 
-def _propagate_mem_kind_dp(*xm, devices=None, srcs=None):
+def _propagate_mem_kind_dp(*xm, devices, srcs, donations):
   memory_kinds = []
   for device in devices:
     if isinstance(device, (Sharding, TransferToMemoryKind)):
