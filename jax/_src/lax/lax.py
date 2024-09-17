@@ -3173,11 +3173,35 @@ def _ragged_dot_transpose_rule(
   return grad_x, grad_y, None
 
 
+def _ragged_dot_batching_rule(
+    batched_args,
+    dims,
+    *,
+    precision,
+    preferred_element_type: DTypeLike | None,
+    **_,
+):
+  assert all([dim == 0 for dim in dims])
+
+  lhs, rhs, group_sizes = batched_args
+
+  lhs = api.vmap(_ragged_to_dense, in_axes=dims)(lhs, rhs, group_sizes)
+
+  return _dot_general_batch_rule(
+      (lhs, rhs),
+      (0, 0),
+      dimension_numbers=_RAGGED_DOT_DOT_DIMENSION_NUMBERS,
+      precision=precision,
+      preferred_element_type=preferred_element_type,
+  )
+
+
 ragged_dot_p = standard_primitive(_ragged_dot_shape_rule,
                                   _ragged_dot_dtype_rule, 'ragged_dot')
 ragged_dot_p.def_impl(partial(dispatch.apply_primitive, ragged_dot_p))
 ad.primitive_jvps[ragged_dot_p] = _ragged_dot_jvp_rule
 ad.primitive_transposes[ragged_dot_p] = _ragged_dot_transpose_rule
+batching.primitive_batchers[ragged_dot_p] = _ragged_dot_batching_rule
 
 def _ragged_dot_impl(
     lhs: Array,
