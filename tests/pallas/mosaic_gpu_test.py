@@ -315,6 +315,58 @@ class PallasCallTest(PallasTest):
     result = kernel(x)
     self.assertEqual(result.shape, (4, 2, 64, 64))
 
+  @parameterized.parameters(jnp.float16, jnp.float32)
+  def test_wgmma(self, dtype):
+    elems_128b = 128 // jnp.dtype(dtype).itemsize
+    # Non-f16 types need to be transposed
+    rhs_transpose = jnp.dtype(dtype).itemsize != 2
+    def kernel(a_ref, b_ref, o_ref):
+      def body(acc):
+        # Effectful call to the wgmma pipeline. Information like
+        # swizzling is encapsulated in the operands.
+        plgpu.primitives.wgmma(acc, a_ref, b_ref, rhs_transpose=rhs_transpose)
+        # Flush the pipeline. An argument of N would allow up to N
+        # wgmma calls in the pipeline.
+        plgpu.primitives.wgmma_wait(0)
+        # Acc is an abstract array reference that we don't want to
+        # dereference before the wgmma pipeline is flished.
+        return acc[...]
+
+      # Create a mutable and scoped accumulator for wgmma.
+      acc_arr = pl.run_scoped(body, plgpu.ACC((64, 128), jnp.float32))
+      o_ref[...] = acc_arr
+
+    _range = lambda shape, dtype: jnp.linspace(
+        0, 1, int(np.prod(shape)), dtype=dtype
+    ).reshape(shape)
+    a = _range((64, 128), dtype)
+    b = _range((128, 128), dtype)
+
+    res = pl.pallas_call(
+        kernel,
+        in_specs=[
+            plgpu.GPUBlockSpec(
+                (64, 128),
+                lambda i, j: (i, j),
+                tiling=(64, elems_128b),
+                swizzle=128,
+            ),
+            plgpu.GPUBlockSpec(
+                (128, 128),
+                lambda *i: i,
+                tiling=(elems_128b, elems_128b),
+                swizzle=128,
+                transpose=rhs_transpose,
+            ),
+        ],
+        out_specs=plgpu.GPUBlockSpec((64, 128), lambda *i: i),
+        out_shape=jax.ShapeDtypeStruct((64, 128), jnp.float32),
+        grid=(1, 1),
+    )(a, b)
+    np.testing.assert_allclose(
+        res, a @ (b.T if rhs_transpose else b), rtol=1e-3
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

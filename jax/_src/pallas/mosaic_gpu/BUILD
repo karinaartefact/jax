@@ -88,7 +88,9 @@ pytype_strict_library(
         ":lowering",
         "//jax",
         "//jax:core",
+        "//jax:effects",
         "//jax:mosaic_gpu",
+        "//jax/_src/lib",
         "//jax/_src/pallas",
     ],
 )
