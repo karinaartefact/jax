@@ -128,7 +128,6 @@ class CompatTest(bctu.CompatTestBase):
         cpu_eigh_lapack_syev.data_2023_03_17,
         cpu_qr_lapack_geqrf.data_2023_03_17,
         cuda_threefry2x32.data_2023_03_15, cuda_threefry2x32.data_2024_07_30,
-        cpu_lu_lapack_getrf.data_2023_06_14,
         cuda_lu_pivots_to_permutation.data_2024_08_08,
         cuda_lu_cusolver_getrf.data_2024_08_19,
         cuda_qr_cusolver_geqrf.data_2023_03_18,
@@ -379,10 +378,8 @@ class CompatTest(bctu.CompatTestBase):
                  c64=np.complex64, c128=np.complex128)[dtype_name]
     shape = (3, 4)
     func = lambda: CompatTest.lu_harness(shape, dtype)
-    # TODO(b/360788062): Clean up after the compatibility period.
-    with config.export_ignore_forward_compatibility(True):
-      data = self.load_testdata(cuda_lu_cusolver_getrf.data_2024_08_19[dtype_name])
-      self.run_one_test(func, data)
+    data = self.load_testdata(cuda_lu_cusolver_getrf.data_2024_08_19[dtype_name])
+    self.run_one_test(func, data)
 
   @staticmethod
   def qr_harness(shape, dtype):
@@ -480,19 +477,13 @@ class CompatTest(bctu.CompatTestBase):
                  c64=np.complex64, c128=np.complex128)[dtype_name]
     shape = (3, 3)
     func = lambda: CompatTest.lu_harness(shape, dtype)
-    data = self.load_testdata(cpu_lu_lapack_getrf.data_2023_06_14[dtype_name])
     operand = np.reshape(np.arange(math.prod(shape), dtype=dtype), shape)
     rtol = dict(f32=1e-3, f64=1e-5, c64=1e-3, c128=1e-5)[dtype_name]
     atol = dict(f32=1e-4, f64=1e-12, c64=1e-4, c128=1e-12)[dtype_name]
+    data = self.load_testdata(cpu_lu_lapack_getrf.data_2024_05_31[dtype_name])
     self.run_one_test(func, data, rtol=rtol, atol=atol,
                       check_results=partial(self.check_lu_results, operand,
                                             dtype=dtype))
-    with config.export_ignore_forward_compatibility(True):
-      # FFI Kernel test
-      data = self.load_testdata(cpu_lu_lapack_getrf.data_2024_05_31[dtype_name])
-      self.run_one_test(func, data, rtol=rtol, atol=atol,
-                        check_results=partial(self.check_lu_results, operand,
-                                              dtype=dtype))
 
   def check_svd_results(self, input, res_run, res_exp,
                         rtol=None, atol=None):
