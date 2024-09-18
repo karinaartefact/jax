@@ -15,6 +15,7 @@
 """Utilities for code generator."""
 
 import dataclasses
+import functools
 import math
 from typing import Callable
 
@@ -318,6 +319,66 @@ class FragmentedArray:
     if not ir.FloatType.isinstance(self.mlir_dtype):
       raise NotImplementedError
     return self._pointwise(lambda s, o: arith.divf(o, s), other)
+
+  def __eq__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.OEQ,
+        si_pred=arith.CmpIPredicate.eq,
+        ui_pred=arith.CmpIPredicate.eq,
+    )
+
+  def __ne__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.UNE,
+        si_pred=arith.CmpIPredicate.ne,
+        ui_pred=arith.CmpIPredicate.ne,
+    )
+
+  def __lt__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.OLT,
+        si_pred=arith.CmpIPredicate.slt,
+        ui_pred=arith.CmpIPredicate.ult,
+    )
+
+  def __le__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.OLE,
+        si_pred=arith.CmpIPredicate.sle,
+        ui_pred=arith.CmpIPredicate.ule,
+    )
+
+  def __gt__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.OGT,
+        si_pred=arith.CmpIPredicate.sgt,
+        ui_pred=arith.CmpIPredicate.ugt,
+    )
+
+  def __ge__(self, other):
+    return self._compare(
+        other,
+        f_pred=arith.CmpFPredicate.OGE,
+        si_pred=arith.CmpIPredicate.sge,
+        ui_pred=arith.CmpIPredicate.uge,
+    )
+
+  def _compare(self, other, *, f_pred, si_pred, ui_pred):
+    if ir.FloatType.isinstance(self.mlir_dtype):
+      pred = functools.partial(arith.cmpf, f_pred)
+    elif ir.IntegerType.isinstance(self.mlir_dtype):
+      if ir.IntegerType(self.mlir_dtype).is_signed:
+        pred = functools.partial(arith.cmpi, si_pred)
+      else:
+        pred = functools.partial(arith.cmpi, ui_pred)
+    else:
+      raise NotImplementedError
+    return self._pointwise(pred, other)
 
   def max(self, other):
     if not ir.FloatType.isinstance(self.mlir_dtype):

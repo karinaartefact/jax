@@ -1234,6 +1234,27 @@ class FragmentedArrayTest(TestCase):
       else:
         np.testing.assert_array_equal(result, np_op(ref_x, ref_rhs))
 
+  @parameterized.parameters(
+      operator.lt,
+      operator.le,
+      operator.gt,
+      operator.ge,
+      operator.eq,
+      operator.ne,
+  )
+  def test_conditional(self, op, m=64, n=32):
+    def kernel(ctx, dst, _):
+      f32 = ir.F32Type.get()
+      iota = iota_tensor(m=m, n=n, mlir_dtype=f32)
+      op(iota, iota + 1).store_untiled(dst)
+
+    out_shape = jax.ShapeDtypeStruct((m, n), jnp.bool)
+    result = mosaic_gpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
+    )()
+    iota = np.arange(m * n, dtype=jnp.float32).reshape(m, n)
+    np.testing.assert_array_equal(result, op(iota, iota + 1))
+
   @parameterized.product(
       ops=(
           (lambda x: mgpu.FragmentedArray.exp(x), np.exp, False),
