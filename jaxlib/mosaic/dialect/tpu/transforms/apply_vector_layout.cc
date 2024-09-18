@@ -52,6 +52,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/types/span.h"
+#include "third_party/llvm/llvm-project/llvm/include/llvm/ADT/ArrayRef.h"
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/include/mlir/Dialect/Vector/IR/VectorOps.h"
@@ -648,7 +649,9 @@ FailureOr<SmallVector<Layout>> getOutLayouts(
   FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> out_layouts,
                              getLayoutArrayFromAttr(op.getAttr("out_layout")));
   if (out_layouts.size() != op.getNumResults()) {
-    return op.emitOpError("out_layout size does not match number of results");
+    return op.emitOpError(
+               "out_layout size does not match number of results. Layouts: ")
+           << out_layouts.size() << " results: " << op.getNumResults();
   }
   for (const auto [l, res] : llvm::zip_equal(out_layouts, op.getResults())) {
     if (!layoutIsValidForValue(l, res, target_shape)) {
@@ -2443,54 +2446,254 @@ LogicalResult tpu_concatenate_rule(RewriteContext &ctx, Operation &op,
   TPU_ASSERT_OP(
       llvm::all_of(layouts_in, [](const Layout &l) { return l.has_value(); }));
   TPU_ASSERT_OP(layouts_out.front().has_value());
-  const VectorLayout &layout = *layouts_out.front();
-  for (const Layout &l : layouts_in) {
-    if (l != layout) {
-      return op.emitOpError("Not implemented: Inconsistent layouts");
-    }
-  }
   OpBuilder builder(&op);
   auto concatenate_op = cast<tpu::ConcatenateOp>(op);
   const VectorType res_ty = concatenate_op.getResult().getType();
   const uint32_t dimension = concatenate_op.getDimension();
-  if (dimension - res_ty.getRank() >= -2) {
-    if (!layout.hasNativeTiling(ctx.target_shape) ||
-        layout.offsets() != LayoutOffsets{0, 0}) {
-      return op.emitOpError(
-          "Not implemented: Only native tiling with offset (0, 0) is supported "
-          "when concatenation along tiling dims.");
-    }
-    // Check if the concat dim size of src and res is aligned to native tiling.
-    auto check_aligned = [&](const VectorType &vty) {
-      auto i = dimension - res_ty.getRank();
-      return vty.getRank() >= 2 &&
-             *(vty.getShape().end() + i) % *(layout.tiling().end() + i) == 0;
-    };
-    bool is_aligned = check_aligned(res_ty);
-    int op_idx = 0;
-    while (is_aligned && op_idx < op.getNumOperands()) {
-      auto vty = dyn_cast<VectorType>(op.getOperand(op_idx++).getType());
-      is_aligned = check_aligned(vty);
-    }
-    if (!is_aligned) {
-      return op.emitOpError(
-          "Not implemented: Only aligned shapes are supported when "
-          "concatenation along tiling dims");
-    }
+  SmallVector<xla::Array<Value>> vregs;
+  vregs.reserve(op.getNumOperands());
+
+  std::optional<int64_t> tiling_dim;
+  if (dimension >= res_ty.getRank() - 2) {
+    tiling_dim = dimension - (res_ty.getRank() - 2);
   }
 
-  SmallVector<xla::Array<Value>> tiles;
-  tiles.reserve(concatenate_op->getNumOperands());
-  for (Value operand : concatenate_op.getOperands()) {
+  // Op level invariants
+  auto res_layout = layouts_out.front();
+  if (!res_layout.has_value()) {
+    return op.emitOpError("Not implemented: expected result layout");
+  }
+  if (tiling_dim.has_value() &&
+      !res_layout->hasNativeTiling(ctx.target_shape)) {
+    return op.emitOpError("Not implemented: result non-native-tiling.");
+  }
+  if (tiling_dim.has_value() && res_layout->offsets() != LayoutOffsets{0, 0}) {
+    return op.emitOpError("Not implemented: result non-zero offset.");
+  }
+
+  auto first_shape = op.getOperand(0).getType().cast<VectorType>().getShape();
+
+  int64_t offset_at_dim = 0;
+  for (int i = 0; i < op.getNumOperands(); ++i) {
+    // Operand level invariants
+    auto operand = op.getOperand(i);
+    if (!layouts_in[i].has_value()) {
+      return op.emitOpError("Not implemented: Expected input layout");
+    }
+    auto const &layout = *layouts_in[i];
+    auto vty = cast<VectorType>(operand.getType());
+    auto shape = vty.getShape();
+    for (int dim = 0; dim < shape.size(); ++dim) {
+      if (dim != dimension && shape[dim] != first_shape[dim]) {
+        return op.emitOpError(
+            "Not implemented: Expected all operands to have "
+            "the same shape outside of the concat dim");
+      }
+    }
+    if (shape.size() < 2) {
+      return op.emitOpError("Not implemented: Expected at least 2 dims");
+    }
+    if (tiling_dim.has_value() && !layout.hasNativeTiling(ctx.target_shape)) {
+      return op.emitOpError(
+          "Not implemented: Unaligned operand non-native-tiling.");
+    }
+    if (layout.implicit_dim() != VectorLayout::ImplicitDim::kNone) {
+      return op.emitOpError("Not implemented: implicit dim");
+    }
+
+    if (tiling_dim.has_value()) {
+      auto starting_point = offset_at_dim;
+      auto offset_amount = starting_point % layout.tiling()[tiling_dim.value()];
+      if (offset_amount != layout.offsets()[tiling_dim.value()]) {
+        return op.emitOpError(
+            "Not implemented: Relayout not called, unaligned dims concatenated "
+            "without proper offsets. Ensure that infer_vector_layout pass was "
+            "called.");
+      }
+    }
+    offset_at_dim += shape[dimension];
+
     FAILUREOR_ASSIGN_OR_RETURN(
-        xla::Array<Value> t,
+        xla::Array<Value> vreg_array,
         disassemble(builder, layout, cast<TypedValue<VectorType>>(operand),
                     ctx.target_shape));
-    tiles.emplace_back(std::move(t));
+    vregs.push_back(std::move(vreg_array));
   }
-  const xla::Array<Value> res_tiles = concatenate(tiles, dimension);
-  op.replaceAllUsesWith(
-      assemble(builder, res_ty, layout, res_tiles, ctx.target_shape));
+
+  CHECK_EQ(vregs.size(), op.getNumOperands());
+
+  const SmallVector<int64_t> vreg_array_shape =
+      res_layout->tileArrayShape(res_ty.getShape(), ctx.target_shape);
+  xla::Array<Value> out_vregs(vreg_array_shape);
+  const int num_batch_dims = res_ty.getRank() - 2;
+  auto res_ty_shape = res_ty.getShape();
+  const ArrayRef<int64_t> batch_dims = res_ty_shape.take_front(num_batch_dims);
+  SmallVector<int64_t> batch_idx(num_batch_dims);
+
+  // Helpers to avoid allocating per loop step
+  // TODO(mvoz): A little boilerplate heavy, consider writing a util.
+  SmallVector<int64_t> read_idx(vreg_array_shape.size(), 0);
+  auto get_read_idx = [&](int64_t _2nd_minor_idx, int64_t minor_idx,
+                          const absl::Span<const int64_t> &batch_bounds)
+      -> std::optional<ArrayRef<int64_t>> {
+    // Batch idx iterates over the operand element space, not the vreg shape.
+    // this means that for certain mismatched concats, we will end up
+    // with vregs that have already been fully written out, as our batch
+    // idx pointer > res shape batch indices.
+    // This means we need to make get_read_idx safe to access oob,
+    // where a fully oob access returns a nullopt and hints to the caller
+    // to proceed onward. This is really just a way of signaling that
+    // we are done with this given batch step.
+    for (size_t i = 0; i < batch_idx.size(); ++i) {
+      auto batch_idx_val = batch_idx[i];
+      if (batch_idx_val >= batch_bounds[i]) {
+        batch_idx_val = 0;
+        return std::nullopt;
+      }
+      read_idx[i] = batch_idx_val;
+    }
+    *(read_idx.end() - 2) = _2nd_minor_idx;
+    *(read_idx.end() - 1) = minor_idx;
+    return read_idx;
+  };
+
+  SmallVector<int64_t> write_idx(vreg_array_shape.size(), 0);
+  auto get_write_idx = [&](int64_t _2nd_minor_idx,
+                           int64_t minor_idx) -> ArrayRef<int64_t> {
+    for (size_t i = 0; i < batch_idx.size(); ++i) {
+      write_idx[i] = batch_idx[i];
+    }
+    *(write_idx.end() - 2) = _2nd_minor_idx;
+    *(write_idx.end() - 1) = minor_idx;
+    return write_idx;
+  };
+
+  // write_offset_pos helps us compute where we are going to write to
+  // There are two primary flows for it - in the case where the concat
+  // dim falls in the last 2 dims, we write to write_offset_pos by tracking
+  // each vreg we've written or blended, and then dividing by the vreg
+  // size for that dim. For the concat flow in all other dims, this
+  // value "steps" forward on every aligned write.
+  auto get_write_offset_pos = [&](const VectorLayout &layout,
+                                  int64_t total_written) {
+    if (tiling_dim.has_value()) {
+      auto bound = layout.tiling()[tiling_dim.value()];
+      return llvm::divideFloorSigned(total_written, bound);
+    }
+    return total_written;
+  };
+
+  auto boundIdxConst =
+      std::bind(IdxConst, std::placeholders::_1, builder, op.getLoc());
+  do {
+    auto total_written = 0;
+
+    for (int i = 0; i < vregs.size(); ++i) {
+      auto operand_layout = layouts_in[i];
+      auto operand_shape =
+          op.getOperand(i).getType().cast<VectorType>().getShape();
+      auto operand_size_at_dim = operand_shape[dimension];
+      auto operand_offset =
+          tiling_dim.has_value()
+              ? operand_layout->offsets()[tiling_dim.value()].value()
+              : 0;
+
+      const auto &curr_vregs = vregs[i];
+      auto curr_vregs_shape = curr_vregs.dimensions();
+      auto row_idx = curr_vregs_shape.size() - 2;
+      auto col_idx = curr_vregs_shape.size() - 1;
+      auto curr_row = 0;
+      auto curr_col = 0;
+      // Middle between prior and current is blended
+      if (operand_offset > 0) {
+        // Illegal to have an offset when we are not in a minor or second
+        // minor concat.
+        CHECK(tiling_dim.has_value());
+        if (tiling_dim.value() == 0) {  // sublane
+          // We need to blend the last written-to-row of the prior vreg with
+          // the first row of the current vreg, into the prior row of the
+          // result.
+          for (int64_t col = 0;
+               col < curr_vregs_shape[col_idx]; ++col) {
+            Value mask = builder.create<tpu::CreateMaskOp>(
+                op.getLoc(),
+                VectorType::get(ctx.target_shape, builder.getI1Type()),
+                ArrayRef<Value>{boundIdxConst(0), boundIdxConst(0)},
+                ArrayRef<Value>{boundIdxConst(operand_offset),
+                                boundIdxConst(layouts_in[i]->tiling()[1])});
+
+            auto write_idx_ = get_write_idx(
+                get_write_offset_pos(*layouts_in[i], total_written), col);
+            auto lhs_ = out_vregs(write_idx_);
+            auto read_idx_rhs = get_read_idx(curr_row, col, curr_vregs_shape);
+            if (!read_idx_rhs.has_value()) {
+              continue;
+            }
+            auto rhs_ = curr_vregs(*read_idx_rhs);
+
+            out_vregs(write_idx_) =
+                builder.create<arith::SelectOp>(op.getLoc(), mask, lhs_, rhs_);
+          }
+          // Advance the row pointer
+          curr_row =
+              (curr_row + 1) % curr_vregs_shape[row_idx];
+        } else {  // lane
+          for (int64_t row = 0;
+               row < curr_vregs_shape[row_idx]; ++row) {
+            Value mask = builder.create<tpu::CreateMaskOp>(
+                op.getLoc(),
+                VectorType::get(ctx.target_shape, builder.getI1Type()),
+                ArrayRef<Value>{boundIdxConst(0), boundIdxConst(0)},
+                ArrayRef<Value>{boundIdxConst(layouts_in[i]->tiling()[0]),
+                                boundIdxConst(operand_offset)});
+
+            auto write_idx_ = get_write_idx(
+                row, get_write_offset_pos(*layouts_in[i], total_written));
+            auto lhs_ = out_vregs(write_idx_);
+            auto read_idx_rhs = get_read_idx(row, curr_col, curr_vregs_shape);
+            if (!read_idx_rhs.has_value()) {
+              continue;
+            }
+            auto rhs_ = curr_vregs(*read_idx_rhs);
+            out_vregs(write_idx_) =
+                builder.create<arith::SelectOp>(op.getLoc(), mask, lhs_, rhs_);
+          }
+          curr_col =
+              (curr_col + 1) % curr_vregs_shape[col_idx];
+        }
+      }
+      // At this point, we have blended the vreg with the partial result
+      // from prior vregs in the output.
+      if (tiling_dim.has_value() && operand_offset != 0 &&
+          (operand_size_at_dim + operand_offset <=
+           layouts_in[i]->tiling()[tiling_dim.value()])) {
+        total_written += operand_size_at_dim;
+        continue;
+      }
+      // If we get here, we see that the vreg has more to write, and finish it
+      // using the aligned flow.
+      // Aligned vreg flow
+      for (int64_t row = curr_row;
+           row < curr_vregs_shape[row_idx]; ++row) {
+        for (int64_t col = curr_col;
+             col < curr_vregs_shape[col_idx]; ++col) {
+          auto read_idx = get_read_idx(row, col, curr_vregs_shape);
+          auto write_idx_ = get_write_idx(row, col);
+          write_idx[dimension] +=
+              get_write_offset_pos(*layouts_in[i], total_written);
+          if (!read_idx.has_value()) {
+            continue;
+          }
+          out_vregs(write_idx_) = curr_vregs(*read_idx);
+        }
+      }
+      total_written += operand_size_at_dim;
+    }
+  } while (incrementIndex(batch_idx, batch_dims));
+
+  auto assembled =
+      assemble(builder, res_ty, *res_layout, out_vregs, ctx.target_shape);
+  op.replaceAllUsesWith(assembled);
   op.erase();
   return success();
 }
