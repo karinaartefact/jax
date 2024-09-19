@@ -122,7 +122,7 @@ def copy(src: ir.Value, dst: ir.Value, swizzle: int | None = None):
   nvvm.fence_proxy(nvvm.ProxyKind.async_)
 
 
-def iota_tensor(m, n, mlir_dtype):
+def iota_tensor(m, n, mlir_dtype, *, is_signed: bool | None = None):
   assert m % 64 == 0
   assert n % 8 == 0
   def c(i):
@@ -147,7 +147,7 @@ def iota_tensor(m, n, mlir_dtype):
       vec = vector.insertelement(value, vec, position=c(col_offset))
     registers[row_tile, col_tile, row_subtile, 0] = vec
   t = mgpu.FragmentedArray(_registers=registers, _layout=mgpu.WGMMA_LAYOUT)
-  return t.astype(mlir_dtype)
+  return t.astype(mlir_dtype, is_signed=is_signed)
 
 
 class TestCase(parameterized.TestCase):
@@ -561,7 +561,7 @@ class WGMMATest(TestCase):
       raise self.skipTest("Copy with non-128B swizzles not implemented")
 
     in_mlir_dtype = in_mlir_dtype_cls.get()
-    out_mlir_dtype = mlir.dtype_to_ir_type(jnp.dtype(jax_out_dtype))
+    out_mlir_dtype = utils.dtype_to_ir_type(jnp.dtype(jax_out_dtype))
     if ir.F32Type.isinstance(in_mlir_dtype):  # We actually use tf32 instead
       in_jax_dtype = jnp.float32
       if lhs_transpose or not rhs_transpose:
@@ -1208,50 +1208,75 @@ class FragmentedArrayTest(TestCase):
           operator.truediv,
           (lambda x, y: mgpu.FragmentedArray.max(x, y), np.maximum),
       ),
+      dtype=[jnp.float32, jnp.int32, jnp.uint32],
       m=(64, 128),
       n=(8, 16, 32, 64, 80, 128, 256),
   )
-  def test_binary(self, op, m=64, n=32):
+  def test_binary(self, op, dtype, m=64, n=32):
     if isinstance(op, tuple):
       op, np_op = op
     else:
       np_op = op
 
+    if not jnp.issubdtype(dtype, jnp.floating) and op is operator.truediv:
+      self.skipTest("Unsupported for integer types")
+
     for scalar_rhs in [None, 2]:
       def kernel(ctx, dst, _):
-        f32 = ir.F32Type.get()
-        iota = iota_tensor(m=m, n=n, mlir_dtype=f32)
-        rhs = iota if scalar_rhs is None else c(scalar_rhs, iota.mlir_dtype)
+        mlir_dtype = utils.dtype_to_ir_type(jnp.dtype(dtype))
+        is_signed = None
+        if jnp.issubdtype(dtype, jnp.integer):
+          is_signed = jnp.issubdtype(dtype, jnp.signedinteger)
+        iota = iota_tensor(m, n, mlir_dtype, is_signed=is_signed)
+        rhs = iota if scalar_rhs is None else c(scalar_rhs, mlir_dtype)
         op(iota, rhs).store_untiled(dst)
-      out_shape = jax.ShapeDtypeStruct((m, n), jnp.float32)
+      out_shape = jax.ShapeDtypeStruct((m, n), dtype)
       result = mosaic_gpu.as_gpu_kernel(
           kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
       )()
-      ref_x = np.arange(m * n, dtype=jnp.float32).reshape(m, n)
+      ref_x = np.arange(m * n, dtype=dtype).reshape(m, n)
       ref_rhs = scalar_rhs or ref_x
-      if op == operator.truediv:
+      if op is operator.truediv:
         np.testing.assert_allclose(result, np_op(ref_x, ref_rhs), atol=2e-7)
       else:
         np.testing.assert_array_equal(result, np_op(ref_x, ref_rhs))
 
   @parameterized.product(
       ops=(
-          (lambda x: mgpu.FragmentedArray.exp(x), np.exp, False),
-          (lambda x: mgpu.FragmentedArray.exp(x, approx=True), np.exp, True),
-          (lambda x: mgpu.FragmentedArray.sin(x), np.sin, False),
-          (lambda x: mgpu.FragmentedArray.sin(x, approx=True), np.sin, True),
-          (lambda x: mgpu.FragmentedArray.cos(x), np.cos, False),
-          (lambda x: mgpu.FragmentedArray.cos(x, approx=True), np.cos, True),
-          (lambda x: mgpu.FragmentedArray.rsqrt(x), jax.lax.rsqrt, False),
-          (lambda x: mgpu.FragmentedArray.rsqrt(x, approx=True), jax.lax.rsqrt, True),
-          (lambda x: -x, jax.lax.neg, False),
-          (lambda x: x + 42.0, lambda x: x + 42.0, False),
+          (lambda x: -x, jax.lax.neg),
+          (lambda x: x + 42, lambda x: x + 42),
       ),
-      m=(64, 128),
-      n=(8, 16, 32, 64, 80, 128, 256),
+      dtype=[jnp.float32, jnp.int32, jnp.uint32],
   )
-  def test_unary(self, ops, m=64, n=32):
-    op, np_op, is_approx = ops
+  def test_unary(self, ops, dtype, m=64, n=32):
+    op, np_op = ops
+
+    def kernel(ctx, dst, _):
+      mlir_dtype = utils.dtype_to_ir_type(jnp.dtype(dtype))
+      is_signed = None
+      if jnp.issubdtype(dtype, jnp.integer):
+        is_signed = jnp.issubdtype(dtype, jnp.signedinteger)
+      iota = iota_tensor(m, n, mlir_dtype, is_signed=is_signed)
+      op(iota).store_untiled(dst)
+
+    out_shape = jax.ShapeDtypeStruct((m, n), dtype)
+    result = mosaic_gpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
+    )()
+    x = np.arange(m * n, dtype=dtype).reshape(m, n)
+    np.testing.assert_allclose(result, np_op(x), atol=2e-7, rtol=2e-7)
+
+  @parameterized.product(
+      ops=[
+          (lambda x: mgpu.FragmentedArray.exp(x), np.exp),
+          (lambda x: mgpu.FragmentedArray.sin(x), np.sin),
+          (lambda x: mgpu.FragmentedArray.cos(x), np.cos),
+          (lambda x: mgpu.FragmentedArray.rsqrt(x), jax.lax.rsqrt),
+      ],
+      approx=[False, True],
+  )
+  def test_math(self, ops, approx, m=64, n=32):
+    op, np_op = ops
     def kernel(ctx, dst, _):
       f32 = ir.F32Type.get()
       iota = iota_tensor(m=m, n=n, mlir_dtype=f32)
@@ -1261,8 +1286,8 @@ class FragmentedArrayTest(TestCase):
         kernel, (1, 1, 1), (128, 1, 1), (), out_shape, ()
     )()
     x = np.arange(m * n, dtype=jnp.float32).reshape(m, n)
-    atol = 5e-3 if is_approx else 2e-7
-    rtol = 4e-6 if is_approx else 2e-7
+    atol = 5e-3 if approx else 2e-7
+    rtol = 4e-6 if approx else 2e-7
     np.testing.assert_allclose(result, np_op(x), atol=atol, rtol=rtol)
 
   @parameterized.product(
@@ -1355,7 +1380,7 @@ class FragmentedArrayTest(TestCase):
   def test_fast_i8_convert(self, jax_dtype_to):
     jax_dtype_to = jnp.dtype(jax_dtype_to)
     jax_dtype_from = jnp.dtype(jnp.int8)
-    mlir_dtype_to = mlir.dtype_to_ir_type(jax_dtype_to)
+    mlir_dtype_to = utils.dtype_to_ir_type(jax_dtype_to)
     def kernel(ctx, inp, out, smem):
       del ctx, smem
       arr = mgpu.FragmentedArray.load_strided(inp)
