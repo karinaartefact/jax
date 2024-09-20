@@ -437,8 +437,8 @@ jax_test(
 )
 
 jax_test(
-    name = "tpu_pallas_mesh_test",
-    srcs = ["tpu_pallas_mesh_test.py"],
+    name = "tpu_pallas_state_test",
+    srcs = ["tpu_pallas_state_test.py"],
     disable_backends = [
         "cpu",
         "gpu",

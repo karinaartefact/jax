@@ -444,6 +444,7 @@ def _run_state_impl(*args: Any, jaxpr: core.Jaxpr,
                     which_linear: tuple[bool, ...]):
   del which_linear
   discharged_jaxpr, consts = discharge_state(jaxpr, ())
+  print("DISCHARGED", discharged_jaxpr)
   return core.eval_jaxpr(discharged_jaxpr, consts, *args)
 run_state_p.def_impl(_run_state_impl)
 mlir.register_lowering(run_state_p, mlir.lower_fun(_run_state_impl))

@@ -431,8 +431,8 @@ class AsyncCopyDescriptor:
   def is_remote(self):
     return self.src_sem is not None
 
-  def start(self):
-    flat_args, tree = tree_util.tree_flatten((
+  def _get_args_and_tree(self):
+    return tree_util.tree_flatten((
         self.src_ref,
         self.src_transforms,
         self.dst_ref,
@@ -443,6 +443,9 @@ class AsyncCopyDescriptor:
         self.src_sem_transforms,
         self.device_id,
     ))
+
+  def start(self):
+    flat_args, tree = self._get_args_and_tree()
     dma_start_p.bind(*flat_args, tree=tree, device_id_type=self.device_id_type)
 
   def wait(self):
@@ -451,27 +454,17 @@ class AsyncCopyDescriptor:
     self.wait_recv()
 
   def wait_recv(self):
-    wait_args, tree = tree_util.tree_flatten((
-        self.dst_sem,
-        self.dst_sem_transforms,
-        self.dst_ref,
-        self.dst_transforms,
-    ))
+    flat_args, tree = self._get_args_and_tree()
     dma_wait_p.bind(
-        *wait_args, tree=tree, device_id_type=self.device_id_type
+        *flat_args, tree=tree, device_id_type=self.device_id_type
     )
 
   def wait_send(self):
     if not self.is_remote:
       raise ValueError("Cannot `wait_send` on a local copy.")
-    wait_args, tree = tree_util.tree_flatten((
-        self.src_sem,
-        self.src_sem_transforms,
-        self.src_ref,
-        self.src_transforms,
-    ))
+    flat_args, tree = self._get_args_and_tree()
     dma_wait_p.bind(
-        *wait_args, tree=tree, device_id_type=self.device_id_type
+        *flat_args, tree=tree, device_id_type=self.device_id_type
     )
 
 
@@ -689,7 +682,17 @@ def _dma_wait_pp_eqn(eqn: jax_core.JaxprEqn,
   del settings
   invars = eqn.invars
   tree = eqn.params["tree"]
-  sem, sem_transforms, ref, transforms = tree_util.tree_unflatten(tree, invars)
+  (
+      _,
+      _,
+      ref,
+      transforms,
+      sem,
+      sem_transforms,
+      _,
+      _,
+      _,
+  ) = tree_util.tree_unflatten(tree, invars)
   return pp.concat([
       pp.text("dma_wait"),
       pp.text(" "),
@@ -703,14 +706,27 @@ jax_core.pp_eqn_rules[dma_wait_p] = _dma_wait_pp_eqn
 def dma_wait_discharge_rule(in_avals, out_avals,
                              *args, tree, device_id_type):
   del out_avals, device_id_type
-  (sem, sem_transforms, ref, ref_transforms) = tree_util.tree_unflatten(
-      tree, args
-  )
   (
-      sem_aval,
-      sem_transforms_avals,
+      _,
+      _,
+      ref,
+      ref_transforms,
+      sem,
+      sem_transforms,
+      _,
+      _,
+      _,
+  ) = tree_util.tree_unflatten(tree, args)
+  (
+      src_ref_aval,
+      src_ref_transforms_avals,
       _,
       ref_transforms_avals,
+      sem_aval,
+      sem_transforms_avals,
+      src_sem_aval,
+      src_sem_transforms_avals,
+      device_id_aval,
   ) = tree_util.tree_unflatten(tree, in_avals)
   num_sem_transforms = len(tree_util.tree_leaves(sem_transforms_avals))
   num_transforms = len(tree_util.tree_leaves(ref_transforms_avals))
@@ -721,10 +737,15 @@ def dma_wait_discharge_rule(in_avals, out_avals,
   _, new_sem = state_discharge.transform_swap_array(
       sem, sem_transforms, sem_value - copy_size
   )
-  new_vals = (new_sem,)  # sem
-  new_vals += (None,) * num_sem_transforms
+  new_vals = (None,)  # src_ref
+  new_vals += (None,) * len(tree_util.tree_leaves(src_ref_transforms_avals))
   new_vals += (None,)  # ref
-  new_vals += (None,) * num_transforms
+  new_vals += (None,) * num_transforms  # ref_transforms
+  new_vals += (new_sem,)  # sem
+  new_vals += (None,) * num_sem_transforms
+  new_vals += (None,) * len(tree_util.tree_leaves(src_sem_aval))  # src_sem
+  new_vals += (None,) * len(tree_util.tree_leaves(src_sem_transforms_avals))
+  new_vals += (None,) * len(tree_util.tree_leaves(device_id_aval)) # device_id
   return new_vals, []
 state_discharge.register_discharge_rule(dma_wait_p)(dma_wait_discharge_rule)
 
