@@ -17,11 +17,16 @@
 from __future__ import annotations
 
 from jax._src import core as jax_core
+from jax._src import effects
 from jax._src import state
+from jax._src.state import discharge
+from jax._src.lib.mlir.dialects import nvvm as nvvm_dialect
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as gpu_core
 from jax._src.pallas.mosaic_gpu import lowering
-
+from jax.experimental.mosaic.gpu import dsl as mgpu
+from jax._src.interpreters import mlir
+import jax.numpy as jnp
 
 async_copy_p = jax_core.Primitive("async_copy")
 async_copy_p.multiple_results = True
@@ -103,3 +108,142 @@ def wait_smem_to_gmem(allow_groups: int) -> None:
 def wait_barrier(barrier: pallas_core.AbstractMemoryRef) -> None:
   """Waits on the given barrier."""
   wait_p.bind(barrier)
+
+
+class _WGMMAPipelineEffect(effects.Effect):
+  pass
+
+
+_wgmma_pipeline_effect = _WGMMAPipelineEffect()
+effects.control_flow_allowed_effects.add_type(_WGMMAPipelineEffect)
+
+wgmma_discharged_p = jax_core.Primitive("wgmma_discharged")
+
+def wgmma(acc, a, b, *, rhs_transpose: bool | None = None, swizzle: int = 128):
+  """Asynchronous warp group matmul.
+
+  The sm90 wgmma instruction, essentially acc[...] += a @ b. Requires
+  that accumulator is an accumualtion register reference.
+
+  Args:
+    acc: The accumulator register.
+    a: The left hand side operand.
+    b: The right hand side operand.
+    transpose: Whether to transpose b.
+    n_tile: The number of tiles to use.
+    swizzle: The swizzle pattern.
+  """
+  rhs_transpose = (
+      (jnp.dtype(b.dtype).itemsize == 2)
+      if rhs_transpose is None
+      else rhs_transpose
+  )
+
+  ma, ka, tma, tka = a.shape
+  kb, nb, tkb, tnb = b.shape
+  mc, nc = acc.shape
+
+  if rhs_transpose:
+    kb, nb, tkb, tnb = nb, kb, tnb, tkb
+
+  if tma * ma != mc or nb * tnb != nc or ka != kb or tka != tkb:
+    raise ValueError(f"Incompatible shapes: {a.shape=}, {b.shape=}, {acc.shape=}, {rhs_transpose=}")
+
+  return wgmma_p.bind(acc, a, b, swizzle=swizzle, rhs_transpose=rhs_transpose)
+
+@wgmma_discharged_p.def_effectful_abstract_eval
+def _wgmma_discharged_effectful_abstract_eval(acc, *args, **kwargs):
+  del args, kwargs
+  return acc, {
+      _wgmma_pipeline_effect,
+      state.ReadEffect(1),
+      state.ReadEffect(2),
+  }
+
+@lowering.register_lowering_rule(wgmma_discharged_p)
+def _wgmma_discharged_lowering_rule(
+    ctx: lowering.LoweringRuleContext,
+    acc,
+    a,
+    b,
+    swizzle,
+    rhs_transpose,
+):
+  del ctx
+  new_acc = mgpu.wgmma(
+      acc,
+      a,
+      b,
+      swizzle=swizzle,
+      b_order=mgpu.WGMMALayout.COL_MAJOR
+      if rhs_transpose
+      else mgpu.WGMMALayout.ROW_MAJOR,
+  )
+  nvvm_dialect.wgmma_commit_group_sync_aligned()
+  return new_acc
+
+wgmma_p = jax_core.Primitive("wgmma")
+wgmma_p.multiple_results = True
+
+@wgmma_p.def_effectful_abstract_eval
+def _wgmma_effectful_abstract_eval(acc, *args, **kwargs):
+  del acc, args, kwargs
+  return [], {
+      _wgmma_pipeline_effect,
+      state.WriteEffect(0),
+      state.ReadEffect(0),
+      state.ReadEffect(1),
+      state.ReadEffect(2),
+  }
+
+@discharge.register_discharge_rule(wgmma_p)
+def _wgmma_discharge_rule(
+    in_avals, out_avals,
+    acc,
+    a,
+    b,
+    swizzle,
+    rhs_transpose,
+):
+  del in_avals, out_avals
+  return (
+      wgmma_discharged_p.bind(
+          acc, a, b, swizzle=swizzle, rhs_transpose=rhs_transpose
+      ),
+      None,
+      None,
+  ), []
+
+wgmma_wait_p = jax_core.Primitive("wgmma_wait")
+wgmma_wait_p.multiple_results = True
+
+def wgmma_wait(i: int):
+  """Wait until all but the last `i` WGMMA operations are done."""
+  return wgmma_wait_p.bind(i)
+
+
+@wgmma_wait_p.def_effectful_abstract_eval
+def wgmma_wait_effectful_abstract_eval(_):
+  return [], {_wgmma_pipeline_effect}
+
+@lowering.register_lowering_rule(wgmma_wait_p)
+def _wgmma_wait_lowering_rule(ctx: lowering.LoweringRuleContext, allow_groups):
+  del ctx
+  nvvm_dialect.wgmma_wait_group_sync_aligned(allow_groups)
+  return ()
+
+zero_accumulator_p =  jax_core.Primitive("zero_accumulator")
+def zero_accumulator(shape, dtype):
+  return zero_accumulator_p.bind(shape=shape, dtype=dtype)
+
+@zero_accumulator_p.def_abstract_eval
+def _zero_accumulator_abstract_eval(shape, dtype):
+  return jax_core.ShapedArray(shape=shape, dtype=dtype)
+
+
+@lowering.register_lowering_rule(zero_accumulator_p)
+def _zero_accumulator_lowering_rule(
+    ctx: lowering.LoweringRuleContext, shape, dtype
+):
+  del ctx
+  return mgpu.WGMMAAccumulator.zero(*shape, dtype=mlir.dtype_to_ir_type(jnp.dtype(dtype)))

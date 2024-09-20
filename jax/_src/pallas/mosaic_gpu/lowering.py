@@ -38,6 +38,8 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas import primitives
 from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.mosaic_gpu import core as gpu_core
+from jax._src.state import discharge
+from jax._src.state import utils as state_utils
 from jax._src.state import primitives as sp
 from jax.experimental.mosaic import gpu as mosaic_gpu
 from jax.experimental.mosaic.gpu import dsl as mgpu
@@ -602,6 +604,10 @@ def _get_lowering_rule(ctx: LoweringRuleContext, x_smem, *indexers, tree):
   del ctx, tree  # Unused.
   if indexers:
     raise NotImplementedError("No support for indexers yet")
+
+  if isinstance(x_smem, mgpu.WGMMAAccumulator):
+    return x_smem.value
+
   return mgpu.FragmentedArray.load_strided(x_smem)
 
 
@@ -612,8 +618,15 @@ def _swap_lowering_rule(
   del ctx, tree  # Unused.
   if indexers:
     raise NotImplementedError("No support for indexers yet")
+
   old_value = mgpu.FragmentedArray.load_strided(x_smem)
-  value.store_untiled(x_smem)
+  if isinstance(value, mgpu.WGMMAAccumulator):
+    # TODO(cperivol): Change to store untiled when we have swizzle
+    # information in the layout.
+    value.value.store_untiled(x_smem)
+  else:
+    value.store_untiled(x_smem)
+
   return old_value
 
 
@@ -707,15 +720,37 @@ def _debug_print_lowering_rule(
 def _run_scoped_lowering_rule(
     ctx: LoweringRuleContext, *consts, jaxpr: jax_core.Jaxpr
 ):
-  in_avals = [v.aval.inner_aval for v in jaxpr.invars]
-  bytes_allocated, input_refs = ctx.module_ctx.scratch_view([
-      jax.ShapeDtypeStruct(shape=aval.shape, dtype=aval.dtype)
-      for aval in in_avals
-  ])
+  input_refs = []
+  bytes_allocated = 0
+  should_discharge = []
+  for a in jaxpr.invars:
+    a = a.aval
+    if isinstance(a, gpu_core.WGMMAAbstractAccumulatorRef):
+      mlir_dtype = mlir.dtype_to_ir_type(a.dtype)
+      input_refs.append(mgpu.WGMMAAccumulator.zero(*a.shape, mlir_dtype))
+      should_discharge.append(True)
+    elif a.memory_space == gpu_core.SMEM:
+      ref_bytes, [input_ref] = ctx.module_ctx.scratch_view(
+          [jax.ShapeDtypeStruct(shape=a.shape, dtype=a.dtype)]
+      )
+      bytes_allocated += ref_bytes
+      input_refs.append(input_ref)
+      should_discharge.append(False)
+    else:
+      raise ValueError(f"Can't convert to ref: {a}")
+
+  no_const_jaxpr = state_utils.hoist_consts_to_refs(jaxpr)
+  should_discharge = [False] * len(consts) + should_discharge
+  discharged_jaxpr, _ = discharge.discharge_state(no_const_jaxpr, (), should_discharge=should_discharge)
   outs = lower_jaxpr_to_mosaic_gpu(
-      ctx.module_ctx, ctx.launch_ctx, jaxpr, input_refs, consts
+      ctx.module_ctx, ctx.launch_ctx, discharged_jaxpr, consts + tuple(input_refs), ()
   )
-  ctx.module_ctx.stack_free_smem(bytes_allocated)
+  # Discharge appends the refs that got discharget to the output
+  outs = outs[sum(should_discharge):]
+  assert len(outs) == len(jaxpr.outvars), (jaxpr, outs)
+  if bytes_allocated:
+    ctx.module_ctx.stack_free_smem(bytes_allocated)
+
   return outs
 
 

@@ -323,6 +323,47 @@ class PallasCallTest(PallasTest):
     x = jnp.arange(256).astype(jnp.float32)
     np.testing.assert_array_equal(kernel(x), x + 2.0 + 3.0)
 
+  @parameterized.parameters(jnp.float16, jnp.float32)
+  def test_wgmma(self, dtype):
+    rhs_transpose = jnp.dtype(dtype).itemsize != 2
+    swizzle = 128
+    elems_128b = swizzle // jnp.dtype(dtype).itemsize
+    def kernel(a_ref, b_ref, o_ref):
+      def scope(acc_ref):
+        plgpu.wgmma(acc_ref, a_ref, b_ref, rhs_transpose=rhs_transpose)
+        plgpu.wgmma_wait(0)
+        return acc_ref[...]
+
+      o_ref[...] = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+
+    key1, key2 = jax.random.split(jax.random.key(42), 2)
+    a = jax.random.uniform(key1, shape=(64, 128), dtype=dtype)
+    b = jax.random.uniform(key2, shape=(128, 128), dtype=dtype)
+
+    res = pl.pallas_call(
+        kernel,
+        in_specs=[
+            plgpu.GPUBlockSpec(
+                (64, 128),
+                lambda i, j: (i, j),
+                tiling=(64, elems_128b),
+                swizzle=128,
+            ),
+            plgpu.GPUBlockSpec(
+                (128, 128),
+                lambda *i: i,
+                transpose_permutation=(1, 0, 2, 3) if rhs_transpose else None,
+                tiling=(elems_128b, elems_128b),
+                swizzle=128,
+            ),
+        ],
+        out_specs=plgpu.GPUBlockSpec((64, 128), lambda *i: i),
+        out_shape=jax.ShapeDtypeStruct((64, 128), jnp.float32),
+        grid=(1, 1),
+    )(a, b)
+    np.testing.assert_allclose(
+        res, a @ (b.T if rhs_transpose else b), rtol=1e-3
+    )
 
 if __name__ == "__main__":
   absltest.main()
