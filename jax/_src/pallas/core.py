@@ -277,6 +277,7 @@ jax_core.raise_to_shaped_mappings[AbstractMemoryRef] = _ref_raise_to_shaped
 class PallasGridContext:
   grid: GridMappingGrid
   mapped_dims: tuple[int, ...]
+  positional_full_and_block_arg_shapes: tuple[any]
 
   def size(self, axis: int) -> int | DynamicGridDim:
     valid_grid = tuple(self.grid)
@@ -422,6 +423,7 @@ class BlockSpec:
       index_map_tree: tree_util.PyTreeDef,
       grid: GridMappingGrid,
       mapped_dims: tuple[int, ...],
+      positional_full_and_block_arg_shapes,
   ) -> BlockMapping:
     if self.index_map is None:
       index_map_func = lambda *args: (0,) * len(array_aval.shape)
@@ -469,7 +471,9 @@ class BlockSpec:
     index_map_src_info = NameAndSrcInfo.from_pallas_call(
         None, debug.func_src_info
     )
-    with tracing_grid_env(grid, mapped_dims):
+    with tracing_grid_env(
+        grid, mapped_dims, positional_full_and_block_arg_shapes
+    ):
       jaxpr, out_avals, consts, () = pe.trace_to_jaxpr_dynamic(
           flat_index_map_fun, index_map_avals, debug_info=debug
       )
@@ -608,11 +612,17 @@ class BlockMapping:
 
 
 @contextlib.contextmanager
-def tracing_grid_env(grid: GridMappingGrid, mapped_dims: tuple[int, ...]):
+def tracing_grid_env(
+    grid: GridMappingGrid,
+    mapped_dims: tuple[int, ...],
+    positional_full_and_block_arg_shapes: tuple[int, ...],
+):
   assert all(i is dynamic_grid_dim or isinstance(i, int) for i in grid)
   old_grid_context = _pallas_tracing_env.grid_context
   try:
-    _pallas_tracing_env.grid_context = PallasGridContext(grid, mapped_dims)
+    _pallas_tracing_env.grid_context = PallasGridContext(
+        grid, mapped_dims, positional_full_and_block_arg_shapes
+    )
     yield
   finally:
     _pallas_tracing_env.grid_context = old_grid_context
@@ -651,6 +661,7 @@ class GridMapping:
   num_inputs: int
   num_outputs: int
   num_scratch_operands: int
+  positional_full_and_block_arg_shapes: tuple[any]
   get_grid_indices: Callable | None = None
   local_grid_env: Callable | None = None
 
@@ -721,7 +732,9 @@ class GridMapping:
       axis_env_ctx = jax_core.extend_axis_env_nd(
           zip(self.grid_names, self.grid)
       )
-    with tracing_grid_env(self.grid, self.vmapped_dims), axis_env_ctx:
+    with tracing_grid_env(
+        self.grid, self.vmapped_dims, self.positional_full_and_block_arg_shapes
+    ), axis_env_ctx:
       yield
 
   @property
@@ -811,6 +824,7 @@ def _convert_block_spec_to_block_mapping(
     index_map_tree: tree_util.PyTreeDef,
     grid: GridMappingGrid,
     mapped_dims: tuple[int, ...],
+    positional_full_and_block_arg_shapes: tuple[any],
 ) -> BlockMapping:
   if block_spec is no_block_spec:
     block_spec = BlockSpec(None, None)
@@ -821,7 +835,9 @@ def _convert_block_spec_to_block_mapping(
       index_map_tree=index_map_tree,
       grid=grid,
       mapped_dims=mapped_dims,
+      positional_full_and_block_arg_shapes=positional_full_and_block_arg_shapes,
   )
+
 
 index_map_grid_aval = jax_core.ShapedArray((), jnp.int32)
 
@@ -898,6 +914,7 @@ def get_grid_mapping(
     out_origins: Sequence[OriginStr],
 ) -> tuple[tuple[jax_core.AbstractValue, ...],
            GridMapping]:
+
   assert all(i is None or isinstance(i, int) for i in grid_spec.grid)
   grid_mapping_grid = tuple(
       dynamic_grid_dim if d is None else d for d in grid_spec.grid
@@ -905,6 +922,13 @@ def get_grid_mapping(
   # The inputs for the index maps
   index_map_avals = (
       (index_map_grid_aval,) * len(grid_spec.grid))
+
+  input_aval_shapes = tuple(
+      aval.shape if isinstance(aval, jax_core.ShapedArray) else None
+      for aval in in_avals
+  )
+  print("index_map_avals:", index_map_avals)
+
   index_map_tree = tree_util.tree_structure((index_map_avals, {}))
 
   num_scalar_prefetch: int = getattr(grid_spec, "num_scalar_prefetch", 0)
@@ -951,6 +975,9 @@ def get_grid_mapping(
   else:
     flat_in_specs = [no_block_spec] * len(in_avals)
 
+  positional_full_and_block_arg_shapes = tuple(
+      zip(input_aval_shapes, [spec.block_shape for spec in flat_in_specs])
+  )
   in_block_mappings = map(
       partial(
           _convert_block_spec_to_block_mapping,
@@ -958,6 +985,7 @@ def get_grid_mapping(
           index_map_tree=index_map_tree,
           grid=grid_mapping_grid,  # type: ignore[arg-type]
           mapped_dims=(),
+          positional_full_and_block_arg_shapes=positional_full_and_block_arg_shapes,
       ),
       flat_in_specs,
       in_origins[num_flat_scalar_prefetch:],
@@ -980,6 +1008,7 @@ def get_grid_mapping(
           index_map_tree=index_map_tree,
           grid=grid_mapping_grid,  # type: ignore[arg-type]
           mapped_dims=(),
+          positional_full_and_block_arg_shapes=positional_full_and_block_arg_shapes,
       ),
       flat_out_specs,
       out_origins,
@@ -996,6 +1025,7 @@ def get_grid_mapping(
       num_inputs=len(flat_in_specs),
       num_outputs=len(flat_out_specs),
       num_scratch_operands=num_flat_scratch_operands,
+      positional_full_and_block_arg_shapes=positional_full_and_block_arg_shapes,
   )
   grid_mapping.check_invariants()
   in_ref_avals = [bm.ref_aval for bm in in_block_mappings]

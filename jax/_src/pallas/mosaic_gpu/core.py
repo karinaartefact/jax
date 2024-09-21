@@ -125,6 +125,7 @@ class GPUBlockSpec(pallas_core.BlockSpec):
       index_map_tree: tree_util.PyTreeDef,
       grid: pallas_core.GridMappingGrid,
       mapped_dims: tuple[int, ...],
+      positional_full_and_block_arg_shapes,
   ) -> GPUBlockMapping:
     bm = super().to_block_mapping(
         origin,
@@ -133,6 +134,7 @@ class GPUBlockSpec(pallas_core.BlockSpec):
         index_map_tree=index_map_tree,
         grid=grid,
         mapped_dims=mapped_dims,
+        positional_full_and_block_arg_shapes=positional_full_and_block_arg_shapes,
     )
     transforms: tuple[pallas_core.MemoryRefTransform, ...] = ()
     if self.tiling is not None:

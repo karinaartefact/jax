@@ -81,6 +81,75 @@ def program_id_bind(*, axis: int):
 def _program_id_abstract_eval(**_):
   return jax_core.ShapedArray((), jnp.int32)
 
+actual_size_p = jax_core.Primitive("actual_size")
+
+
+def actual_size(ref_idx) -> jax.Array:
+  """Returns the actual size of the ref at the current program id."""
+  return actual_size_p.bind(ref_idx=ref_idx)
+
+
+@actual_size_p.def_custom_bind
+def _actual_size_bind(*, ref_idx):
+  frame = pallas_core.axis_frame()
+  # There are 2 flows here - static and ragged.
+  # The static flow is for when we know the grid statically, and there
+  # are no bint types in the ref. In this case, there are 2 subcases:
+  # we are in a "full" tile, that is, the total size of the user data
+  # covers the entire tile, or we are in a "Partial" tile, that is, the
+  # user data covers only a portion of the tile. That last case can only
+  # occur on the last tile of a given grid.
+  #
+  # The ragged flow is for when we know the grid statically, but there are
+  # bint types in the ref. In this case, we need to query the actual size
+  # of the ref, which is only known at runtime. We do this by querying the
+  # grid env for the current program id, and then using that to index into
+  # the ref. This only differs for the ragged axis, for the dense axes, the
+  # flow is the same as the static flow. (NOT DONE YET)
+  grid = frame.grid
+  original_shape, block_shape = frame.positional_full_and_block_arg_shapes[
+      ref_idx
+  ]
+  actual_shape = list(original_shape)
+  for i, _ in enumerate(grid):
+    ref_size_at_axis = block_shape[i]
+    original_size_at_axis = original_shape[i]
+    axis_program_id = program_id(i)
+    total_size = axis_program_id * ref_size_at_axis
+
+    would_spill = total_size + ref_size_at_axis > original_size_at_axis
+
+    def spill_fn(_):
+      remaining_size = original_size_at_axis - total_size
+
+      def positive_remaining_size(_):
+        return remaining_size
+
+      def zero_or_negative_remaining_size(_):
+        return ref_size_at_axis
+
+      return lax.cond(
+          remaining_size > 0,
+          positive_remaining_size,
+          zero_or_negative_remaining_size,
+          operand=None,
+      )
+
+    def no_spill_fn(_):
+      return ref_size_at_axis
+
+    actual_shape[i] = lax.cond(would_spill, spill_fn, no_spill_fn, operand=None)
+
+  return actual_shape
+
+
+@actual_size_p.def_abstract_eval
+def _actual_size_abstract_eval(ref_idx, **_):
+  frame = pallas_core.axis_frame()
+  original_shape, _ = frame.positional_full_and_block_arg_shapes[ref_idx]
+  return jax_core.ShapedArray(len(original_shape), jnp.int32)
+
+
 num_programs_p = jax_core.Primitive("num_programs")
 
 def num_programs(axis: int) -> int | jax.Array:
